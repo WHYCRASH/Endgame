@@ -1,1 +1,2 @@
-test
+This file exists only to bootstrap the repo (GitHub Contents API requires at
+least one file to create a non-empty repo). It is safe to delete.

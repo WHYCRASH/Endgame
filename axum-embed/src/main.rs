@@ -347,18 +347,17 @@ async fn main() -> Result<()> {
         .parse()
         .context("LISTEN_ADDR is not a valid socket address")?;
 
-    // Resolve model codes to fastembed enum variants. fastembed's
-    // EmbeddingModel::from_str matches on the Debug form of the variant
-    // (e.g. "MultilingualE5Small"), not the model_code string. So we do the
-    // lookup by model_code ourselves.
-    let embed_model = fastembed::models::text_embedding::EmbeddingModel::MultilingualE5Small;
+    // Resolve model codes to fastembed enum variants. The `models` module is
+    // private in fastembed-rs; the public re-export is at the crate root as
+    // `fastembed::EmbeddingModel`. Use that, not the deep path.
+    let embed_model = EmbeddingModel::MultilingualE5Small;
     let rerank_model = RerankerModel::BGERerankerBase;
 
     // Sanity-check that the env-provided code strings actually match what
     // we're loading — surfaces config typos early instead of silently serving
     // a different model.
     let actual_embed_code =
-        fastembed::TextEmbedding::get_model_info(&embed_model)
+        TextEmbedding::get_model_info(&embed_model)
             .map(|i| i.model_code.clone())
             .unwrap_or_else(|| embed_model_code.clone());
     if actual_embed_code != embed_model_code {

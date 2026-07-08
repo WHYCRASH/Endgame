@@ -1,40 +1,65 @@
 # =========================================================================
-# Endgame — Open WebUI + axum-embed + Qdrant + MetaMCP
+# Endgame — Open WebUI + axum-embed + Qdrant + MetaMCP + function-sync
 # =========================================================================
-# Bring-up: `cp .env.example .env && docker compose up -d`
+# Bring-up:
+#   cp .env.example .env
+#   # fill in: ANTHROPIC_API_KEY, OPENAI_API_KEY, WEBUI_SECRET_KEY,
+#   #          OPENWEBUI_ADMIN_API_KEY, METAMCP_API_KEY, METAMCP_POSTGRES_PASSWORD
+#   podman compose up -d
+#
+# Tested with `podman compose` (podman 5.x ships a compose v2 plugin).
+# `docker compose` also works if you'd rather use that — the file is
+# Compose-spec compliant.
 #
 # Notes:
+#  - open-webui is built from the WHYCRASH/open-webui-Custom fork, NOT the
+#    upstream ghcr image. The fork disables torch + sentence-transformers
+#    in requirements.txt (axum-embed handles embeddings+rerank via
+#    fastembed-rs), saving ~2.5GB image size and significant RAM.
+#  - The open-webui-fork and metamcp submodules must be checked out:
+#      git clone --recurse-submodules <this-repo>
+#    If you already cloned without --recurse:
+#      git submodule update --init --recursive
 #  - axum-embed downloads ONNX models on first boot (~1-2 min). The
-#    healthcheck start-period is set to 120s to absorb this; open-webui
-#    will retry embeddings until axum-embed is healthy.
-#  - The metamcp submodule must be checked out (handled by
-#    `git clone --recurse-submodules`). If you cloned without --recurse,
-#    run `git submodule update --init --recursive`.
-#  - Open WebUI is configured entirely via .env (passed through `env_file`).
-#    Admin UI changes persist in its sqlite volume and override .env on
-#    subsequent restarts (see ENABLE_PERSISTENT_CONFIG). If you want .env
-#    to stay authoritative, set ENABLE_PERSISTENT_CONFIG=false.
+#    healthcheck start_period absorbs this; open-webui depends on it being
+#    healthy before it starts.
+#  - function-sync is a one-shot container: it reads functions/*.py and
+#    tools/*.py from this repo and reconciles them into Open WebUI via the
+#    API, then exits. It runs after open-webui is healthy.
+#  - Open WebUI is configured via .env. Admin UI changes persist in its
+#    sqlite volume and override .env on subsequent restarts (see
+#    ENABLE_PERSISTENT_CONFIG). To keep .env authoritative, set
+#    ENABLE_PERSISTENT_CONFIG=false in .env.
 # =========================================================================
 
 name: endgame
 
 services:
   # -----------------------------------------------------------------------
-  # Open WebUI
+  # Open WebUI — built from WHYCRASH/open-webui-Custom fork
   # -----------------------------------------------------------------------
+  # The fork's Dockerfile + requirements.txt have been slimmed: torch and
+  # sentence-transformers are removed in the non-CUDA path. Embeddings +
+  # reranking are delegated to the axum-embed sidecar via
+  # RAG_EMBEDDING_ENGINE=openai and RAG_RERANKING_ENGINE=external.
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    container_name: endgame-open-webui
+    build:
+      context: ./open-webui-Custom
+      dockerfile: Dockerfile
+      args:
+        # Slim defaults; the fork's Dockerfile honours these.
+        USE_CUDA: "false"
+        USE_OLLAMA: "false"
+        USE_SLIM: "false"
     restart: unless-stopped
     env_file: .env
     environment:
-      # Anthropic + OpenRouter keys + everything in .env flow through here.
-      # Explicitly name the things open-webui expects:
+      # LLMs
       - ANTHROPIC_API_KEY
       - OPENAI_API_KEY
       - OPENAI_API_BASE_URL
       - WEBUI_SECRET_KEY
-      # RAG wiring
+      # RAG wiring -> axum-embed
       - RAG_EMBEDDING_ENGINE
       - RAG_EMBEDDING_MODEL
       - RAG_OPENAI_API_BASE_URL
@@ -49,16 +74,16 @@ services:
       - RAG_TOP_K
       - RAG_TOP_K_RERANKER
       - RAG_RELEVANCE_THRESHOLD
-      # Vector DB
+      # Vector DB -> qdrant
       - VECTOR_DB
       - QDRANT_URI
-      # MCP tool server
+      # MCP tool server -> metamcp
       - ENABLE_DIRECT_CONNECTIONS
       - TOOL_SERVER_CONNECTIONS
     volumes:
       - open-webui-data:/app/backend/data
     ports:
-      - "3000:8080"  # open-webui internally listens on 8080; we expose on host :3000
+      - "3000:8080"
     depends_on:
       axum-embed:
         condition: service_healthy
@@ -74,7 +99,6 @@ services:
     build:
       context: ./axum-embed
       dockerfile: Dockerfile
-    container_name: endgame-axum-embed
     restart: unless-stopped
     env_file: .env
     environment:
@@ -84,16 +108,13 @@ services:
       - LISTEN_ADDR
       - INTRA_THREADS
     volumes:
-      # Persist the HF model cache across container recreates; otherwise
-      # every `docker compose up --force-recreate` re-downloads ~500MB.
       - axum-cache:/data/.fastembed_cache
     ports:
-      - "8081:8080"  # host:8081 -> container:8080
+      - "8081:8080"
     healthcheck:
       test: ["CMD", "/bin/sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080; printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3; cat <&3 | head -1 | grep -q 200 || exit 1"]
       interval: 15s
       timeout: 3s
-      # First-boot model download can take ~2 min on slow networks.
       start_period: 180s
       retries: 5
     networks:
@@ -104,13 +125,12 @@ services:
   # -----------------------------------------------------------------------
   qdrant:
     image: qdrant/qdrant:latest
-    container_name: endgame-qdrant
     restart: unless-stopped
     volumes:
       - qdrant-data:/qdrant/storage
     ports:
-      - "6333:6333"   # REST
-      - "6334:6334"   # gRPC (optional; open-webui uses REST by default)
+      - "6333:6333"
+      - "6334:6334"
     healthcheck:
       test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
       interval: 15s
@@ -123,14 +143,10 @@ services:
   # -----------------------------------------------------------------------
   # MetaMCP — MCP aggregator (Umbrella-IT-Group fork, umbrella branch)
   # -----------------------------------------------------------------------
-  # Built from the git submodule at ./metamcp. The submodule must be checked
-  # out; if `ls metamcp/Dockerfile` is empty, run:
-  #   git submodule update --init --recursive
   metamcp:
     build:
       context: ./metamcp
       dockerfile: Dockerfile
-    container_name: endgame-metamcp
     restart: unless-stopped
     env_file: .env
     environment:
@@ -140,13 +156,12 @@ services:
       metamcp-postgres:
         condition: service_healthy
     ports:
-      - "12008:12008"  # MetaMCP HTTP (SSE + streamable HTTP + OpenAPI)
+      - "12008:12008"
     networks:
       - endgame-net
 
   metamcp-postgres:
     image: postgres:16-alpine
-    container_name: endgame-metamcp-postgres
     restart: unless-stopped
     environment:
       - POSTGRES_USER=metamcp
@@ -162,12 +177,41 @@ services:
     networks:
       - endgame-net
 
+  # -----------------------------------------------------------------------
+  # function-sync — one-shot bootstrap container
+  # -----------------------------------------------------------------------
+  # Reads functions/*.py and tools/*.py from this repo and reconciles them
+  # into Open WebUI via /api/v1/functions/sync (declarative) and per-tool
+  # /create /update /delete (manual diff, since tools have no /sync).
+  # Deletions in the repo propagate to the instance.
+  # Runs after open-webui is healthy, then exits 0.
+  function-sync:
+    build:
+      context: ./sync
+      dockerfile: Dockerfile
+    restart: "no"
+    env_file: .env
+    environment:
+      - OPENWEBUI_URL=http://open-webui:8080
+      - OPENWEBUI_API_KEY=${OPENWEBUI_ADMIN_API_KEY:?OPENWEBUI_ADMIN_API_KEY must be set}
+      - FUNCTIONS_DIR=/functions
+      - TOOLS_DIR=/tools
+    volumes:
+      # Read-only mounts of the repo's source dirs into the sync container.
+      - ./functions:/functions:ro
+      - ./tools:/tools:ro
+    depends_on:
+      open-webui:
+        condition: service_healthy
+    networks:
+      - endgame-net
+
 # =========================================================================
 # Volumes + networks
 # =========================================================================
 volumes:
   open-webui-data:    # open-webui sqlite db, uploads, cache
-  axum-cache:         # fastembed ONNX model cache (intfloat/multilingual-e5-small + BAAI/bge-reranker-base)
+  axum-cache:         # fastembed ONNX model cache (e5-small + bge-reranker-base)
   qdrant-data:        # qdrant collections
   metamcp-pg-data:    # metamcp's postgres
 

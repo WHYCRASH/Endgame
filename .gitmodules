@@ -1,0 +1,4 @@
+[submodule "metamcp"]
+	path = metamcp
+	url = https://github.com/Umbrella-IT-Group/metamcp.git
+	branch = umbrella

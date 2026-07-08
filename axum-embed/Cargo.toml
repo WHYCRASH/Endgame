@@ -1,0 +1,19 @@
+[package]
+name = "axum-embed"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "axum-embed"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+fastembed = { version = "5", default-features = false, features = ["hf-hub"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }

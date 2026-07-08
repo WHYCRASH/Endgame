@@ -1,0 +1,176 @@
+# =========================================================================
+# Endgame — Open WebUI + axum-embed + Qdrant + MetaMCP
+# =========================================================================
+# Bring-up: `cp .env.example .env && docker compose up -d`
+#
+# Notes:
+#  - axum-embed downloads ONNX models on first boot (~1-2 min). The
+#    healthcheck start-period is set to 120s to absorb this; open-webui
+#    will retry embeddings until axum-embed is healthy.
+#  - The metamcp submodule must be checked out (handled by
+#    `git clone --recurse-submodules`). If you cloned without --recurse,
+#    run `git submodule update --init --recursive`.
+#  - Open WebUI is configured entirely via .env (passed through `env_file`).
+#    Admin UI changes persist in its sqlite volume and override .env on
+#    subsequent restarts (see ENABLE_PERSISTENT_CONFIG). If you want .env
+#    to stay authoritative, set ENABLE_PERSISTENT_CONFIG=false.
+# =========================================================================
+
+name: endgame
+
+services:
+  # -----------------------------------------------------------------------
+  # Open WebUI
+  # -----------------------------------------------------------------------
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: endgame-open-webui
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Anthropic + OpenRouter keys + everything in .env flow through here.
+      # Explicitly name the things open-webui expects:
+      - ANTHROPIC_API_KEY
+      - OPENAI_API_KEY
+      - OPENAI_API_BASE_URL
+      - WEBUI_SECRET_KEY
+      # RAG wiring
+      - RAG_EMBEDDING_ENGINE
+      - RAG_EMBEDDING_MODEL
+      - RAG_OPENAI_API_BASE_URL
+      - RAG_OPENAI_API_KEY
+      - RAG_EMBEDDING_QUERY_PREFIX
+      - RAG_EMBEDDING_CONTENT_PREFIX
+      - RAG_RERANKING_ENGINE
+      - RAG_RERANKING_MODEL
+      - RAG_EXTERNAL_RERANKER_URL
+      - RAG_EXTERNAL_RERANKER_API_KEY
+      - ENABLE_RAG_HYBRID_SEARCH
+      - RAG_TOP_K
+      - RAG_TOP_K_RERANKER
+      - RAG_RELEVANCE_THRESHOLD
+      # Vector DB
+      - VECTOR_DB
+      - QDRANT_URI
+      # MCP tool server
+      - ENABLE_DIRECT_CONNECTIONS
+      - TOOL_SERVER_CONNECTIONS
+    volumes:
+      - open-webui-data:/app/backend/data
+    ports:
+      - "3000:8080"  # open-webui internally listens on 8080; we expose on host :3000
+    depends_on:
+      axum-embed:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    networks:
+      - endgame-net
+
+  # -----------------------------------------------------------------------
+  # axum-embed — Rust translation server (fastembed-rs)
+  # -----------------------------------------------------------------------
+  axum-embed:
+    build:
+      context: ./axum-embed
+      dockerfile: Dockerfile
+    container_name: endgame-axum-embed
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - EMBED_MODEL
+      - RERANK_MODEL
+      - FASTEMBED_CACHE_DIR
+      - LISTEN_ADDR
+      - INTRA_THREADS
+    volumes:
+      # Persist the HF model cache across container recreates; otherwise
+      # every `docker compose up --force-recreate` re-downloads ~500MB.
+      - axum-cache:/data/.fastembed_cache
+    ports:
+      - "8081:8080"  # host:8081 -> container:8080
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080; printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3; cat <&3 | head -1 | grep -q 200 || exit 1"]
+      interval: 15s
+      timeout: 3s
+      # First-boot model download can take ~2 min on slow networks.
+      start_period: 180s
+      retries: 5
+    networks:
+      - endgame-net
+
+  # -----------------------------------------------------------------------
+  # Qdrant — vector database
+  # -----------------------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: endgame-qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant-data:/qdrant/storage
+    ports:
+      - "6333:6333"   # REST
+      - "6334:6334"   # gRPC (optional; open-webui uses REST by default)
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      - endgame-net
+
+  # -----------------------------------------------------------------------
+  # MetaMCP — MCP aggregator (Umbrella-IT-Group fork, umbrella branch)
+  # -----------------------------------------------------------------------
+  # Built from the git submodule at ./metamcp. The submodule must be checked
+  # out; if `ls metamcp/Dockerfile` is empty, run:
+  #   git submodule update --init --recursive
+  metamcp:
+    build:
+      context: ./metamcp
+      dockerfile: Dockerfile
+    container_name: endgame-metamcp
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - METAMCP_API_KEY
+      - METAMCP_POSTGRES_PASSWORD
+    depends_on:
+      metamcp-postgres:
+        condition: service_healthy
+    ports:
+      - "12008:12008"  # MetaMCP HTTP (SSE + streamable HTTP + OpenAPI)
+    networks:
+      - endgame-net
+
+  metamcp-postgres:
+    image: postgres:16-alpine
+    container_name: endgame-metamcp-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=metamcp
+      - POSTGRES_PASSWORD=${METAMCP_POSTGRES_PASSWORD:?METAMCP_POSTGRES_PASSWORD must be set}
+      - POSTGRES_DB=metamcp
+    volumes:
+      - metamcp-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metamcp"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - endgame-net
+
+# =========================================================================
+# Volumes + networks
+# =========================================================================
+volumes:
+  open-webui-data:    # open-webui sqlite db, uploads, cache
+  axum-cache:         # fastembed ONNX model cache (intfloat/multilingual-e5-small + BAAI/bge-reranker-base)
+  qdrant-data:        # qdrant collections
+  metamcp-pg-data:    # metamcp's postgres
+
+networks:
+  endgame-net:
+    driver: bridge

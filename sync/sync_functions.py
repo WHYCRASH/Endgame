@@ -11,6 +11,12 @@ Tools: manual diff. There is no `/sync` endpoint for tools; we export the
 current set, diff against local files, and call /create /id/{id}/update
 /id/{id}/delete as needed. Deletions in the repo propagate.
 
+Layout:
+  functions/<id>.py                       flat, id = lowercased stem
+  tools/<id>.py                           flat, id = lowercased stem
+  tools/<dir>/main.py                     subdir layout, id = lowercased dir name
+  tools/<dir>/__init__.py                 subdir layout, id = lowercased dir name
+
 Auth: requires an admin API key (functions/sync and tools/create are
 admin-only). Pass via $OPENWEBUI_API_KEY.
 """
@@ -20,7 +26,6 @@ from __future__ import annotations
 import os
 import re
 import sys
-import json
 import time
 from pathlib import Path
 from typing import Any
@@ -34,9 +39,8 @@ OPENWEBUI_API_KEY = os.environ.get("OPENWEBUI_API_KEY")
 FUNCTIONS_DIR = Path(os.environ.get("FUNCTIONS_DIR", "/functions"))
 TOOLS_DIR = Path(os.environ.get("TOOLS_DIR", "/tools"))
 
-# A list of files in tools/ that are NOT to be treated as tool source.
-# (READMEs, drafts, anything that's not a real tool to install.)
-TOOL_IGNORE = {"README.md", "README.txt", ".gitkeep"}
+# Files that are documentation, not tool/function source.
+IGNORE = {"README.md", "README.txt", "README.rst", ".gitkeep", "__pycache__"}
 
 
 def _headers() -> dict[str, str]:
@@ -49,9 +53,8 @@ def _headers() -> dict[str, str]:
 
 
 def _wait_for_open_webui(timeout: int = 300) -> None:
-    """Poll /health until Open WebUI is up. The compose `depends_on: condition:
-    service_healthy` should make this redundant, but keep it as a belt-and-
-    braces check in case the healthcheck lies."""
+    """Poll /health until Open WebUI is up. Belt-and-braces on top of the
+    compose `depends_on: condition: service_healthy`."""
     deadline = time.time() + timeout
     last_err: str | None = None
     while time.time() < deadline:
@@ -91,36 +94,69 @@ def parse_frontmatter(content: str) -> dict[str, Any]:
         return {}
 
 
+def _load_one(path: Path, function_id: str) -> dict[str, Any] | None:
+    """Read a single .py file and return its sync record, or None if skipped."""
+    if not function_id.isidentifier():
+        print(f"  WARN: '{path}' -> id '{function_id}' is not a valid Python identifier; skipping", file=sys.stderr)
+        return None
+    content = path.read_text(encoding="utf-8")
+    fm = parse_frontmatter(content)
+    name = fm.get("title") or function_id
+    description = fm.get("description") or ""
+    return {
+        "id": function_id,
+        "name": str(name),
+        "content": content,
+        "meta": {"description": description, "manifest": fm},
+        "frontmatter": fm,
+    }
+
+
 def load_py_files(directory: Path) -> list[dict[str, Any]]:
-    """Read every *.py file in `directory`, return a list of dicts:
-        {id, name, content, meta, frontmatter}
-    `id` is the lowercased filename without .py.
+    """Walk `directory` for Open WebUI function/tool source files.
+
+    Recognized layouts (in priority order):
+      - <dir>/<id>.py           flat file, id = lowercased stem
+      - <dir>/<id>/main.py      subdir, id = lowercased subdir name
+      - <dir>/<id>/__init__.py  subdir, id = lowercased subdir name
+
+    If both <id>.py and <id>/main.py exist, the flat file wins.
     """
     out: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
     if not directory.exists():
         return out
+
+    # Pass 1: top-level .py files.
     for path in sorted(directory.iterdir()):
-        if path.suffix != ".py":
+        if path.name in IGNORE:
             continue
-        if path.name in TOOL_IGNORE:
+        if path.is_file() and path.suffix == ".py":
+            fid = path.stem.lower()
+            if fid in seen_ids:
+                continue
+            rec = _load_one(path, fid)
+            if rec:
+                out.append(rec)
+                seen_ids.add(fid)
+
+    # Pass 2: subdirectory main.py / __init__.py.
+    for sub in sorted(directory.iterdir()):
+        if not sub.is_dir():
             continue
-        content = path.read_text(encoding="utf-8")
-        fm = parse_frontmatter(content)
-        function_id = path.stem.lower()
-        if not function_id.isidentifier():
-            print(f"  WARN: '{path.name}' -> id '{function_id}' is not a valid Python identifier; skipping", file=sys.stderr)
+        if sub.name in IGNORE or sub.name.startswith("."):
             continue
-        name = fm.get("title") or function_id
-        description = fm.get("description") or ""
-        out.append(
-            {
-                "id": function_id,
-                "name": str(name),
-                "content": content,
-                "meta": {"description": description, "manifest": fm},
-                "frontmatter": fm,
-            }
-        )
+        fid = sub.name.lower()
+        if fid in seen_ids:
+            continue
+        for candidate in (sub / "main.py", sub / "__init__.py"):
+            if candidate.is_file():
+                rec = _load_one(candidate, fid)
+                if rec:
+                    out.append(rec)
+                    seen_ids.add(fid)
+                break
+
     return out
 
 
@@ -161,9 +197,6 @@ def sync_tools() -> None:
     for t in local:
         print(f"    - {t['id']:40s} {t['name']}")
 
-    # Export current tools. /api/v1/tools/export is admin-only and returns
-    # ToolModel[]. Tools that come from MCP/OpenAPI servers are NOT in this
-    # list (they're dynamic), so we won't accidentally delete those.
     r = requests.get(
         f"{OPENWEBUI_URL}/api/v1/tools/export",
         headers=_headers(),
@@ -173,7 +206,6 @@ def sync_tools() -> None:
         print(f"  ERR  /tools/export {r.status_code}: {r.text[:500]}", file=sys.stderr)
         sys.exit(1)
     remote = r.json()
-    # Some installs return ToolModel[] directly; some wrap. Be defensive.
     if isinstance(remote, dict) and "data" in remote:
         remote = remote["data"]
     remote_by_id = {t["id"]: t for t in remote}
@@ -189,7 +221,6 @@ def sync_tools() -> None:
             "access_grants": [],
         }
         if tid in remote_by_id:
-            # Update if content changed.
             if remote_by_id[tid].get("content") != t["content"]:
                 rr = requests.post(
                     f"{OPENWEBUI_URL}/api/v1/tools/id/{tid}/update",
@@ -215,7 +246,7 @@ def sync_tools() -> None:
             else:
                 print(f"  ERR  create {tid} {rr.status_code}: {rr.text[:300]}", file=sys.stderr)
 
-    # 2. Delete (deletions propagate, per user decision)
+    # 2. Delete (deletions propagate)
     for tid in remote_by_id:
         if tid not in local_by_id:
             rr = requests.delete(

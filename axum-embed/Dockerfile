@@ -3,7 +3,7 @@
 # so we do NOT need system ONNX libs. We do need pkg-config + libssl-dev
 # for the hf-hub reqwest client.
 
-ARG RUST_VERSION=1.82
+ARG RUST_VERSION=1.97
 
 # ---------------------------------------------------------------------------
 # Build stage

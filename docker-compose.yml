@@ -160,6 +160,8 @@ services:
       - POSTGRES_PORT=5432
       - POSTGRES_USER=metamcp
       - DATABASE_URL=postgresql://metamcp:${METAMCP_POSTGRES_PASSWORD}@metamcp-postgres:5432/metamcp
+      - BETTER_AUTH_SECRET
+      - APP_URL
     depends_on:
       metamcp-postgres:
         condition: service_healthy

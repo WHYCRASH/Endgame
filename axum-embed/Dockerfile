@@ -22,6 +22,12 @@ WORKDIR /app
 # Cache deps separately from source for faster incremental builds.
 COPY Cargo.toml ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs
+# Dummy-binary cache bug: the first build above produces an empty `axum-embed`
+# stub binary from `fn main() {}`. Because the build cache mount is shared
+# between the two RUN steps, cargo's incremental fingerprint will see the
+# stub's mtime as newer than the real source on the second build and skip
+# relinking, shipping the dummy stub as the final binary. The second build
+# deletes the stub first to force a relink from the real source.
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release || true
@@ -30,6 +36,7 @@ RUN --mount=type=cache,target=/app/target \
 COPY src ./src
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
+    rm -f target/release/axum-embed && \
     cargo build --release && \
     cp ./target/release/axum-embed /usr/local/bin/axum-embed
 

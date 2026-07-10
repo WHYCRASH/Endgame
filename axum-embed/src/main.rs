@@ -43,12 +43,10 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
 struct AppState {
-    /// TextEmbedding is sync; we hold it behind Arc and clone the Arc into
-    /// handlers. embed() takes &self (not &mut self), so concurrent calls
-    /// are fine.
-    embed: Arc<TextEmbedding>,
-    /// TextRerank::rerank takes &mut self, so we need a mutex for real
-    /// exclusive access.
+    /// TextEmbedding::embed takes &mut self in fastembed 5.x, so we need a
+    /// mutex for exclusive access.
+    embed: Arc<tokio::sync::Mutex<TextEmbedding>>,
+    /// TextRerank::rerank also takes &mut self.
     rerank: Arc<tokio::sync::Mutex<TextRerank>>,
     embed_model_code: String,
     rerank_model_code: String,
@@ -127,7 +125,8 @@ async fn embeddings_handler(
 
     // fastembed-rs is synchronous; offload to a blocking thread.
     let result = tokio::task::spawn_blocking(move || {
-        embed.embed(inputs.clone(), None)
+        let mut guard = embed.blocking_lock();
+        guard.embed(inputs.clone(), None)
     })
     .await
     .map_err(|e| AppError::Internal(format!("join error: {e}")))?;
@@ -221,7 +220,10 @@ async fn rerank_handler(
     let result = tokio::task::spawn_blocking(move || {
         // fastembed's rerank takes &mut self.
         let mut guard = rerank.blocking_lock();
-        guard.rerank(query.as_str(), docs.as_slice(), return_documents, None)
+        // Pass query as String and docs as &[String] so S=String (String:
+        // AsRef<str>). Mixing &str query with &[String] docs infers S=&str
+        // and fails because &[String] != AsRef<[&str]>.
+        guard.rerank(query, &docs, return_documents, None)
     })
     .await
     .map_err(|e| AppError::Internal(format!("join error: {e}")))?;
@@ -356,18 +358,22 @@ async fn main() -> Result<()> {
     // Sanity-check that the env-provided code strings actually match what
     // we're loading — surfaces config typos early instead of silently serving
     // a different model.
+    //
+    // fastembed 5.17.2 API notes:
+    //   - TextEmbedding::get_model_info returns Result<&ModelInfo, _>
+    //     (not Option), so unwrap_or_else takes |e|.
+    //   - TextRerank::get_model_info returns RerankerModelInfo directly
+    //     (panics if not found), not Option/Result, so no .map() needed.
     let actual_embed_code =
         TextEmbedding::get_model_info(&embed_model)
             .map(|i| i.model_code.clone())
-            .unwrap_or_else(|| embed_model_code.clone());
+            .unwrap_or_else(|_| embed_model_code.clone());
     if actual_embed_code != embed_model_code {
         tracing::warn!(
             "EMBED_MODEL='{embed_model_code}' does not match the loaded variant's model_code '{actual_embed_code}'. Using the variant anyway."
         );
     }
-    let actual_rerank_code = TextRerank::get_model_info(&rerank_model)
-        .map(|i| i.model_code.clone())
-        .unwrap_or_else(|| rerank_model_code.clone());
+    let actual_rerank_code = TextRerank::get_model_info(&rerank_model).model_code.clone();
     if actual_rerank_code != rerank_model_code {
         tracing::warn!(
             "RERANK_MODEL='{rerank_model_code}' does not match the loaded variant's model_code '{actual_rerank_code}'. Using the variant anyway."
@@ -389,7 +395,7 @@ async fn main() -> Result<()> {
     .context("failed to load rerank model")?;
 
     let state = AppState {
-        embed: Arc::new(embed),
+        embed: Arc::new(tokio::sync::Mutex::new(embed)),
         rerank: Arc::new(tokio::sync::Mutex::new(rerank)),
         embed_model_code: actual_embed_code,
         rerank_model_code: actual_rerank_code,

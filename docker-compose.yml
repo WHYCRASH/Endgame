@@ -143,6 +143,10 @@ services:
   # -----------------------------------------------------------------------
   # MetaMCP — MCP aggregator (Umbrella-IT-Group fork, umbrella branch)
   # -----------------------------------------------------------------------
+  # The entrypoint (docker-entrypoint.sh) defaults POSTGRES_HOST=postgres
+  # and POSTGRES_USER=postgres, but our compose service is named
+  # metamcp-postgres and we create the role as `metamcp`. drizzle (backend)
+  # reads process.env.DATABASE_URL directly, so we set all three explicitly.
   metamcp:
     build:
       context: ./metamcp
@@ -152,6 +156,10 @@ services:
     environment:
       - METAMCP_API_KEY
       - METAMCP_POSTGRES_PASSWORD
+      - POSTGRES_HOST=metamcp-postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=metamcp
+      - DATABASE_URL=postgresql://metamcp:${METAMCP_POSTGRES_PASSWORD}@metamcp-postgres:5432/metamcp
     depends_on:
       metamcp-postgres:
         condition: service_healthy
